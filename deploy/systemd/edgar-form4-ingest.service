@@ -1,0 +1,21 @@
+[Unit]
+Description=EDGAR Form 4 open-market purchase ingest
+Documentation=file:///opt/edgar-form4/docs/DAILY_OPS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=form4
+Group=form4
+Nice=10
+EnvironmentFile=-/opt/edgar-form4/etc/edgar-form4.env
+WorkingDirectory=/opt/edgar-form4
+ExecStart=/opt/edgar-form4/scripts/run-ingest.sh
+TimeoutStartSec=1h
+SyslogIdentifier=edgar-form4-ingest
+ReadWritePaths=/var/lib/edgar-form4 /var/lib/state-capture/announce -/run/state
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true

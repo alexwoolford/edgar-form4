@@ -1,0 +1,11 @@
+Description:           Daily Index of EDGAR Documents (fixture)
+Last Data Received:    Sep 11, 2026
+Comments:              test fixture — not a live SEC file
+
+CIK|Company Name|Form Type|Date Filed|Filename
+--------------------------------------------------------------------------------
+0000320193|Apple Inc.|4|20260911|edgar/data/320193/0000320193-26-000200.txt
+0000104169|Walmart Inc.|4|20260911|edgar/data/104169/0000104169-26-000060.txt
+0000320193|Apple Inc.|4/A|20260911|edgar/data/320193/0000320193-26-000201.txt
+0000320193|Apple Inc.|8-K|20260911|edgar/data/320193/0000320193-26-000123.txt
+0001018724|Amazon.com Inc.|10-K|20260911|edgar/data/1018724/0001018724-26-000010.txt

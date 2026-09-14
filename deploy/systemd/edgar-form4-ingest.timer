@@ -1,0 +1,12 @@
+[Unit]
+Description=EDGAR Form 4 open-market purchase ingest
+Documentation=file:///opt/edgar-form4/docs/DAILY_OPS.md
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+Unit=edgar-form4-ingest.service
+
+[Install]
+WantedBy=timers.target
