@@ -19,7 +19,9 @@ Pin: `capturable-state` git tag `v0.1.1` (not a path dep; do not copy `src/*.rs`
 
 Identity: `trade_id` = `accession|owner_cik|transaction_date|security_title|shares|price|direct_or_indirect` (P1). Purchases are insert-once; an identical rerun must not emit a new outbox row (`ON CONFLICT … WHERE` any column differs). A 4/A is a **new** accession. Soft-delete unused in v1.
 
-A filing with no code-P rows is a successful skip (not a stored empty row, not a failure). Ticker comes from `company_tickers_exchange.json` primary-common rank copied in this crate (no path dep). Unlisted CIK → ticker NULL.
+A filing with a parseable `<ownershipDocument>` and no code-P rows is a successful skip (not a stored empty row, not a failure). HTTP 200 with no `<ownershipDocument>` is `filings_failed` — do not treat that as “no purchases.” Ticker comes from `company_tickers_exchange.json` primary-common rank copied in this crate (no path dep). Unlisted CIK → ticker NULL.
+
+Joint filings: one captured row per `(reportingOwner × code-P transaction)`. Cluster pictures count distinct `rpt_owner_name`. Do not sum `transaction_shares` across owners on the same accession — that double-counts a jointly reported lot.
 
 These are **labels**, not leads. Code P is the disclosure, not a mosaic-generated cluster score.
 

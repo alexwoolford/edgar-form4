@@ -1,0 +1,10 @@
+<SEC-DOCUMENT>
+<DOCUMENT>
+<TYPE>4
+<SEQUENCE>1
+<FILENAME>form4.htm
+<TEXT>
+This complete submission has no ownership XML (HTML-only exhibit).
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>

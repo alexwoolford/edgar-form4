@@ -15,6 +15,7 @@ Operator logs: `tracing` on stderr → journald (`SyslogIdentifier=edgar-form4-i
 | User | `form4` (do not reuse `edgar`) |
 | Env | `/opt/edgar-form4/etc/edgar-form4.env` (`chmod 600`) |
 | Timer | `edgar-form4-ingest.timer` **08:00 UTC** + 15m jitter, `Persistent=true` |
+| Oneshot timeout | `TimeoutStartSec=3h` (Form 4 is the largest daily EDGAR form type; hundreds of `.txt` GETs at 0.5s sleep, peak days can exceed 1h) |
 
 No published `current/`. Do not copy a laptop sqlite onto the host.
 
@@ -37,7 +38,7 @@ sudo ./deploy/install.sh
 
 Do not hand-edit sqlite.
 
-Weekend / US holiday master-index **404 is success** (`status=ok`, zero filings). From this OCI IP an unpublished weekend path is often **403** rather than 404 — Sat/Sun 403 is the same success. Weekday index 403 is `status=error` (UA/Akamai). Index 5xx after retries is `status=error` (unit failed). Some filings 403/404 is `partial` (exit 0).
+Weekend / US holiday master-index **404 is success** (`status=ok`, zero filings). From this OCI IP an unpublished weekend path is often **403** rather than 404 — Sat/Sun 403 is the same success. Weekday index 403 is `status=error` (UA/Akamai). Index 5xx after retries is `status=error` (unit failed). Some filings 403/404, or HTTP 200 with no `<ownershipDocument>`, is `partial` (exit 0). Do not lower `EDGAR_SLEEP_SECS` to beat the 3h timeout (SEC 10 req/s ceiling).
 
 ## SEC fair access
 

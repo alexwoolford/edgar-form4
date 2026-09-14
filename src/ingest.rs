@@ -156,9 +156,8 @@ fn resolve_filing(
     if txt.status != 200 {
         anyhow::bail!("filing HTTP {} for {url}", txt.status);
     }
-    stats.txt_ok += 1;
     let ticker = tickers.get(&row.cik).cloned();
-    Ok(parse_purchases(
+    let purchases = parse_purchases(
         &txt.body,
         &accession,
         &row.cik,
@@ -167,7 +166,9 @@ fn resolve_filing(
         &row.filed_date,
         &row.filename,
         ticker,
-    ))
+    )?;
+    stats.txt_ok += 1;
+    Ok(purchases)
 }
 
 /// Missing daily index: 404 always, or 403 on Sat/Sun UTC (OCI often 403s
@@ -411,6 +412,86 @@ mod tests {
         assert_eq!(stats.filings_failed, 1);
         assert_eq!(stats.status, "partial");
         assert_eq!(stats.filings_upserted, 1);
+    }
+
+    #[test]
+    fn missing_ownership_xml_counts_as_failed() {
+        let mut t = test_db();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let filename = "edgar/data/320193/0000320193-26-000299.txt";
+        let idx = "Description: fixture\n\nCIK|Company Name|Form Type|Date Filed|Filename\n--------------------------------------------------------------------------------\n0000320193|Apple Inc.|4|20260911|edgar/data/320193/0000320193-26-000299.txt\n";
+        let mut urls = HashMap::new();
+        urls.insert(
+            master_index_url(date),
+            HttpResponse {
+                status: 200,
+                body: idx.into(),
+            },
+        );
+        urls.insert(
+            TICKERS_URL.to_string(),
+            HttpResponse {
+                status: 200,
+                body: include_str!("../fixtures/company_tickers_exchange.json").into(),
+            },
+        );
+        urls.insert(
+            filing_url(filename),
+            HttpResponse {
+                status: 200,
+                body: include_str!("../fixtures/aapl-form4-no-xml.txt").into(),
+            },
+        );
+        let mut fetcher = MapFetcher { urls };
+        let stats = ingest_day(&mut t.db, date, &mut fetcher).unwrap();
+        assert_eq!(stats.filings_seen, 1);
+        assert_eq!(stats.txt_ok, 0);
+        assert_eq!(stats.filings_failed, 1);
+        assert_eq!(stats.filings_upserted, 0);
+        assert_eq!(stats.status, "partial");
+        assert!(lookup_purchases(&t.db, "AAPL").unwrap().is_empty());
+    }
+
+    #[test]
+    fn joint_filing_upserts_one_row_per_owner() {
+        let mut t = test_db();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let filename = "edgar/data/320193/0000320193-26-000210.txt";
+        let idx = "Description: fixture\n\nCIK|Company Name|Form Type|Date Filed|Filename\n--------------------------------------------------------------------------------\n0000320193|Apple Inc.|4|20260911|edgar/data/320193/0000320193-26-000210.txt\n";
+        let mut urls = HashMap::new();
+        urls.insert(
+            master_index_url(date),
+            HttpResponse {
+                status: 200,
+                body: idx.into(),
+            },
+        );
+        urls.insert(
+            TICKERS_URL.to_string(),
+            HttpResponse {
+                status: 200,
+                body: include_str!("../fixtures/company_tickers_exchange.json").into(),
+            },
+        );
+        urls.insert(
+            filing_url(filename),
+            HttpResponse {
+                status: 200,
+                body: include_str!("../fixtures/aapl-form4-joint.txt").into(),
+            },
+        );
+        let mut fetcher = MapFetcher { urls };
+        let stats = ingest_day(&mut t.db, date, &mut fetcher).unwrap();
+        assert_eq!(stats.filings_seen, 1);
+        assert_eq!(stats.txt_ok, 1);
+        assert_eq!(stats.filings_failed, 0);
+        assert_eq!(stats.filings_upserted, 2);
+        assert_eq!(stats.status, "ok");
+        let rows = lookup_purchases(&t.db, "AAPL").unwrap();
+        assert_eq!(rows.len(), 2);
+        let names: Vec<&str> = rows.iter().map(|r| r.rpt_owner_name.as_str()).collect();
+        assert!(names.contains(&"Cook Timothy D"));
+        assert!(names.contains(&"Maestri Luca"));
     }
 
     #[test]
