@@ -38,7 +38,13 @@ sudo ./deploy/install.sh
 
 Do not hand-edit sqlite.
 
-Weekend / US holiday master-index **404 is success** (`status=ok`, zero filings). From this OCI IP an unpublished weekend path is often **403** rather than 404 — Sat/Sun 403 is the same success. Weekday index 403 is `status=error` (UA/Akamai). Index 5xx after retries is `status=error` (unit failed). Some filings 403/404, or HTTP 200 with no `<ownershipDocument>`, is `partial` (exit 0). Do not lower `EDGAR_SLEEP_SECS` to beat the 3h timeout (SEC 10 req/s ceiling).
+Weekend / US holiday master-index **404 is success** (`status=ok`, zero filings). From this OCI IP an unpublished weekend path is often **403** rather than 404 — Sat/Sun 403 is the same success. Weekday index 403 is `status=error` (UA/Akamai), **including weekday US holidays**. If the NYSE calendar was closed and the index 403'd, treat it as a closed market: do not hand-edit sqlite; the next session's ingest is the next real day. Index 5xx and transport errors retry (four attempts, exponential backoff) then `status=error` (unit failed).
+
+Some filings 403/404 (not retried), or HTTP 200 with no `<ownershipDocument>` / no `<reportingOwner>`, is `partial` (**exit 1** — systemd marks the oneshot failed). Query `ingest_runs.filings_failed` in mosaic. `filings_upserted` is purchase rows, not filing count. Do not lower `EDGAR_SLEEP_SECS` to beat the 3h timeout (SEC 10 req/s ceiling).
+
+## Backfill (`--from` / `--to`)
+
+Same per-day function as the timer. Form 4 `transaction_date` already spans older trades inside one filing day; 8-K `filed_date` is the scarce side. Run a range **after** 8-K history exists. Do not raise nightly `TimeoutStartSec` for this — Form 4 is heavier than 8-K (more `.txt` GETs). Invoke `run-ingest.sh` with `EDGAR_INGEST_FROM` / `EDGAR_INGEST_TO` outside the timer. Weekday 403 stops the loop.
 
 ## SEC fair access
 

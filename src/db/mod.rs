@@ -30,7 +30,7 @@ impl DerefMut for WorkDb {
     }
 }
 
-pub fn open(path: &Path) -> Result<Connection> {
+fn open_conn(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -38,6 +38,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         }
     }
     let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    apply_runtime_pragmas(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -46,16 +47,12 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+pub fn open(path: &Path) -> Result<Connection> {
+    open_conn(path)
+}
+
 pub fn open_work(path: &Path) -> Result<WorkDb> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-    }
-    let conn = Connection::open(path).with_context(|| format!("open work {}", path.display()))?;
-    apply_runtime_pragmas(&conn)?;
-    apply_schema(&conn)?;
+    let conn = open_conn(path)?;
     let nudge = install_capture(&conn, path)?;
     Ok(WorkDb { conn, nudge })
 }
@@ -246,10 +243,10 @@ pub fn lookup_purchases(conn: &Connection, q: &str) -> Result<Vec<Purchase>> {
                 filename, source
          FROM purchases
          WHERE accession = ?1 OR cik = ?2 OR ticker = ?3 OR owner_cik = ?2
-               OR rpt_owner_name LIKE ?4
+               OR rpt_owner_name LIKE ?4 ESCAPE '\\'
          ORDER BY transaction_date DESC, accession, trade_id",
     )?;
-    let like = format!("%{q}%");
+    let like = like_substring(q);
     let rows = stmt.query_map(params![acc, cik, ticker, like], |r| {
         Ok(Purchase {
             trade_id: r.get(0)?,
@@ -285,4 +282,19 @@ pub fn lookup_purchases(conn: &Connection, q: &str) -> Result<Vec<Purchase>> {
 pub fn outbox_count(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM _outbox", [], |r| r.get(0))
         .context("outbox count")
+}
+
+fn like_substring(q: &str) -> String {
+    let mut out = String::from("%");
+    for c in q.chars() {
+        match c {
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('%');
+    out
 }

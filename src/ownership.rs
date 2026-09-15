@@ -1,7 +1,8 @@
 //! Ownership XML inside a Form 4 complete-submission `.txt`.
 //! Capture non-derivative table rows whose transaction code is `P` only.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use roxmltree::Node;
 
 use crate::index::normalize_date;
 use crate::tickers::pad_cik;
@@ -40,42 +41,69 @@ pub fn parse_purchases(
     form: &str,
     filed_date: &str,
     filename: &str,
-    ticker: Option<String>,
+    ticker_fallback: Option<String>,
 ) -> Result<Vec<Purchase>> {
-    let Some(doc) = ownership_document(body) else {
+    let Some(xml) = extract_ownership_xml(body) else {
         bail!("no ownershipDocument in {filename}");
     };
-    let owners = parse_owners(doc);
-    let table = tag_inner(doc, "nonDerivativeTable").unwrap_or("");
+    let doc = roxmltree::Document::parse(xml)
+        .with_context(|| format!("parse ownership XML in {filename}"))?;
+    let root = doc.root_element();
+    if !local_eq(root, "ownershipDocument") {
+        bail!("no ownershipDocument in {filename}");
+    }
+
+    let owners = parse_owners(root, filename)?;
+    let ticker = issuer_trading_symbol(root).or(ticker_fallback);
     let is_amendment = i64::from(form.eq_ignore_ascii_case("4/A"));
+    let txs = non_derivative_transactions(root);
     let mut out = Vec::new();
     for owner in &owners {
-        for tx in each_tagged(table, "nonDerivativeTransaction") {
-            let code = tag_text(tx, "transactionCode").unwrap_or_default();
+        for (tx_index, tx) in txs.iter().enumerate() {
+            let code = tag_text(*tx, "transactionCode").unwrap_or_default();
             if !code.eq_ignore_ascii_case("P") {
                 continue;
             }
             let Some(transaction_date) =
-                tag_text(tx, "transactionDate").and_then(|s| normalize_date(&s))
+                tag_text(*tx, "transactionDate").and_then(|s| normalize_date(&s))
             else {
+                tracing::warn!(
+                    filename,
+                    accession,
+                    tx_index,
+                    "skipping code-P row: missing transactionDate"
+                );
                 continue;
             };
-            let security_title = collapse_ws(&tag_text(tx, "securityTitle").unwrap_or_default());
+            let security_title = collapse_ws(&tag_text(*tx, "securityTitle").unwrap_or_default());
             if security_title.is_empty() {
+                tracing::warn!(
+                    filename,
+                    accession,
+                    tx_index,
+                    "skipping code-P row: missing securityTitle"
+                );
                 continue;
             }
             let transaction_shares =
-                collapse_ws(&tag_text(tx, "transactionShares").unwrap_or_default());
+                collapse_ws(&tag_text(*tx, "transactionShares").unwrap_or_default());
             if transaction_shares.is_empty() {
+                tracing::warn!(
+                    filename,
+                    accession,
+                    tx_index,
+                    "skipping code-P row: missing transactionShares"
+                );
                 continue;
             }
-            let transaction_price = nonempty(tag_text(tx, "transactionPricePerShare"));
-            let acquired_disposed = nonempty(tag_text(tx, "transactionAcquiredDisposedCode"));
-            let direct_or_indirect = nonempty(tag_text(tx, "directOrIndirectOwnership"));
+            let transaction_price = nonempty(tag_text(*tx, "transactionPricePerShare"));
+            let acquired_disposed = nonempty(tag_text(*tx, "transactionAcquiredDisposedCode"));
+            let direct_or_indirect = nonempty(tag_text(*tx, "directOrIndirectOwnership"));
             let owner_cik = owner.cik.clone();
             let trade_id = make_trade_id(
                 accession,
                 &owner_cik,
+                tx_index,
                 &transaction_date,
                 &security_title,
                 &transaction_shares,
@@ -110,9 +138,11 @@ pub fn parse_purchases(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn make_trade_id(
     accession: &str,
     owner_cik: &str,
+    tx_index: usize,
     transaction_date: &str,
     security_title: &str,
     shares: &str,
@@ -120,7 +150,7 @@ pub fn make_trade_id(
     direct_or_indirect: &str,
 ) -> String {
     format!(
-        "{accession}|{owner_cik}|{transaction_date}|{security_title}|{shares}|{price}|{direct_or_indirect}"
+        "{accession}|{owner_cik}|{tx_index}|{transaction_date}|{security_title}|{shares}|{price}|{direct_or_indirect}"
     )
 }
 
@@ -133,13 +163,10 @@ struct Owner {
     is_officer: i64,
 }
 
-fn parse_owners(doc: &str) -> Vec<Owner> {
-    let blocks = each_tagged(doc, "reportingOwner");
-    if blocks.is_empty() {
-        return vec![Owner::default()];
-    }
-    blocks
-        .into_iter()
+fn parse_owners<'a, 'input>(root: Node<'a, 'input>, filename: &str) -> Result<Vec<Owner>> {
+    let owners: Vec<Owner> = root
+        .descendants()
+        .filter(|n| local_eq(*n, "reportingOwner"))
         .map(|block| Owner {
             cik: pad_cik(&tag_text(block, "rptOwnerCik").unwrap_or_default()),
             name: collapse_ws(&tag_text(block, "rptOwnerName").unwrap_or_default()),
@@ -147,82 +174,56 @@ fn parse_owners(doc: &str) -> Vec<Owner> {
             is_director: flag(tag_text(block, "isDirector")),
             is_officer: flag(tag_text(block, "isOfficer")),
         })
+        .collect();
+    if owners.is_empty() {
+        bail!("no reportingOwner in {filename}");
+    }
+    Ok(owners)
+}
+
+fn issuer_trading_symbol(root: Node<'_, '_>) -> Option<String> {
+    nonempty(tag_text(root, "issuerTradingSymbol")).map(|s| s.to_ascii_uppercase())
+}
+
+fn non_derivative_transactions<'a, 'input>(root: Node<'a, 'input>) -> Vec<Node<'a, 'input>> {
+    let Some(table) = root
+        .descendants()
+        .find(|n| local_eq(*n, "nonDerivativeTable"))
+    else {
+        return Vec::new();
+    };
+    table
+        .children()
+        .filter(|n| local_eq(*n, "nonDerivativeTransaction"))
         .collect()
 }
 
-fn ownership_document(body: &str) -> Option<&str> {
-    tag_inner(body, "ownershipDocument")
+fn extract_ownership_xml(body: &str) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let start = find_ci(bytes, b"<ownershipdocument")?;
+    let close = b"</ownershipdocument>";
+    let rel = find_ci(&bytes[start..], close)?;
+    Some(&body[start..start + rel + close.len()])
 }
 
-fn tag_inner<'a>(hay: &'a str, tag: &str) -> Option<&'a str> {
-    let (start, close_len) = find_open_close(hay, tag)?;
-    Some(&hay[start.0..start.1.saturating_sub(close_len)])
+fn local_eq(node: Node<'_, '_>, tag: &str) -> bool {
+    node.is_element() && node.tag_name().name().eq_ignore_ascii_case(tag)
 }
 
-/// Returns (inner_start..close_end, close_tag_len) where the slice
-/// `hay[inner_start..close_end-close_tag_len]` is the inner XML.
-fn find_open_close(hay: &str, tag: &str) -> Option<((usize, usize), usize)> {
-    let bytes = hay.as_bytes();
-    let open = format!("<{tag}").to_ascii_lowercase();
-    let close = format!("</{tag}>").to_ascii_lowercase();
-    let i = find_ci(bytes, open.as_bytes())?;
-    let gt_rel = hay[i..].find('>')?;
-    let inner_start = i + gt_rel + 1;
-    let end_rel = find_ci(&bytes[inner_start..], close.as_bytes())?;
-    let close_end = inner_start + end_rel + close.len();
-    Some(((inner_start, close_end), close.len()))
-}
-
-fn each_tagged<'a>(hay: &'a str, tag: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut offset = 0;
-    let open = format!("<{tag}").to_ascii_lowercase();
-    let close = format!("</{tag}>").to_ascii_lowercase();
-    let bytes = hay.as_bytes();
-    while let Some(i) = find_ci(&bytes[offset..], open.as_bytes()) {
-        let abs = offset + i;
-        let Some(gt_rel) = hay[abs..].find('>') else {
-            break;
-        };
-        let inner_start = abs + gt_rel + 1;
-        let Some(end_rel) = find_ci(&bytes[inner_start..], close.as_bytes()) else {
-            break;
-        };
-        out.push(&hay[inner_start..inner_start + end_rel]);
-        offset = inner_start + end_rel + close.len();
+fn tag_text(scope: Node<'_, '_>, tag: &str) -> Option<String> {
+    let el = scope.descendants().find(|n| local_eq(*n, tag))?;
+    if let Some(v) = el.children().find(|n| local_eq(*n, "value")) {
+        return nonempty(Some(element_text(v)));
     }
-    out
+    nonempty(Some(element_text(el)))
 }
 
-fn tag_text(hay: &str, tag: &str) -> Option<String> {
-    let inner = tag_inner(hay, tag)?;
-    if let Some(v) = tag_inner(inner, "value") {
-        let t = collapse_ws(&text_content(v));
-        if t.is_empty() {
-            return None;
-        }
-        return Some(t);
-    }
-    let t = collapse_ws(&text_content(inner));
-    if t.is_empty() {
-        None
-    } else {
-        Some(t)
-    }
-}
-
-fn text_content(s: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out
+fn element_text(el: Node<'_, '_>) -> String {
+    el.descendants()
+        .filter(|n| n.is_text())
+        .filter_map(|n| n.text())
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -230,7 +231,7 @@ fn collapse_ws(s: &str) -> String {
 }
 
 fn nonempty(s: Option<String>) -> Option<String> {
-    s.filter(|v| !v.is_empty())
+    s.map(|v| collapse_ws(&v)).filter(|v| !v.is_empty())
 }
 
 fn flag(s: Option<String>) -> i64 {
@@ -255,6 +256,26 @@ fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn parse_fixture(
+        body: &str,
+        accession: &str,
+        cik: &str,
+        name: &str,
+        form: &str,
+    ) -> Vec<Purchase> {
+        parse_purchases(
+            body,
+            accession,
+            cik,
+            name,
+            form,
+            "2026-09-11",
+            "edgar/data/320193/fixture.txt",
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn parses_code_p_skips_sale_and_derivative() {
         let body = include_str!("../fixtures/aapl-form4-purchase.txt");
@@ -266,7 +287,7 @@ mod tests {
             "4",
             "2026-09-11",
             "edgar/data/320193/0000320193-26-000200.txt",
-            Some("AAPL".into()),
+            None,
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
@@ -277,7 +298,11 @@ mod tests {
         assert_eq!(rows[0].is_officer, 1);
         assert_eq!(rows[0].is_director, 1);
         assert_eq!(rows[0].direct_or_indirect.as_deref(), Some("D"));
-        assert!(rows[0].trade_id.contains("0000320193-26-000200"));
+        assert_eq!(rows[0].ticker.as_deref(), Some("AAPL"));
+        assert_eq!(
+            rows[0].trade_id,
+            "0000320193-26-000200|0001214156|0|2026-09-10|Common Stock|10000|150.25|D"
+        );
     }
 
     #[test]
@@ -291,7 +316,7 @@ mod tests {
             "4",
             "2026-09-11",
             "edgar/data/104169/0000104169-26-000060.txt",
-            Some("WMT".into()),
+            None,
         )
         .unwrap();
         assert!(rows.is_empty());
@@ -325,7 +350,7 @@ mod tests {
             "4",
             "2026-09-11",
             "edgar/data/320193/0000320193-26-000210.txt",
-            Some("AAPL".into()),
+            None,
         )
         .unwrap();
         assert_eq!(rows.len(), 2);
@@ -335,5 +360,148 @@ mod tests {
         assert_ne!(rows[0].owner_cik, rows[1].owner_cik);
         assert_ne!(rows[0].trade_id, rows[1].trade_id);
         assert!(rows.iter().all(|r| r.transaction_shares == "10000"));
+        assert!(rows.iter().all(|r| r.trade_id.contains("|0|")));
+    }
+
+    #[test]
+    fn duplicate_same_day_p_rows_get_distinct_trade_ids() {
+        let body = include_str!("../fixtures/aapl-form4-two-purchases.txt");
+        let rows = parse_purchases(
+            body,
+            "0000320193-26-000220",
+            "0000320193",
+            "Apple Inc.",
+            "4",
+            "2026-09-11",
+            "edgar/data/320193/0000320193-26-000220.txt",
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].transaction_shares, rows[1].transaction_shares);
+        assert_eq!(rows[0].transaction_price, rows[1].transaction_price);
+        assert_ne!(rows[0].trade_id, rows[1].trade_id);
+        assert!(rows[0].trade_id.contains("|0|"));
+        assert!(rows[1].trade_id.contains("|1|"));
+    }
+
+    #[test]
+    fn prefers_issuer_trading_symbol_over_fallback() {
+        let body = include_str!("../fixtures/aapl-form4-purchase.txt");
+        let rows = parse_purchases(
+            body,
+            "0000320193-26-000200",
+            "0000320193",
+            "Apple Inc.",
+            "4",
+            "2026-09-11",
+            "edgar/data/320193/0000320193-26-000200.txt",
+            Some("NOTAAPL".into()),
+        )
+        .unwrap();
+        assert_eq!(rows[0].ticker.as_deref(), Some("AAPL"));
+    }
+
+    #[test]
+    fn uses_ticker_fallback_when_symbol_missing() {
+        let body = r#"<ownershipDocument>
+  <reportingOwner><rptOwnerCik>0001214156</rptOwnerCik><rptOwnerName>Cook</rptOwnerName></reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-09-10</value></transactionDate>
+      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+      <transactionShares><value>1</value></transactionShares>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"#;
+        let rows = parse_purchases(
+            body,
+            "0000320193-26-000001",
+            "0000320193",
+            "Apple Inc.",
+            "4",
+            "2026-09-11",
+            "x.txt",
+            Some("AAPL".into()),
+        )
+        .unwrap();
+        assert_eq!(rows[0].ticker.as_deref(), Some("AAPL"));
+    }
+
+    #[test]
+    fn missing_reporting_owner_is_error() {
+        let body = r#"<ownershipDocument>
+  <issuerTradingSymbol>AAPL</issuerTradingSymbol>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-09-10</value></transactionDate>
+      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+      <transactionShares><value>1</value></transactionShares>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"#;
+        let err = parse_purchases(
+            body,
+            "0000320193-26-000001",
+            "0000320193",
+            "Apple Inc.",
+            "4",
+            "2026-09-11",
+            "x.txt",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no reportingOwner"));
+    }
+
+    #[test]
+    fn incomplete_code_p_row_is_skipped_not_stored() {
+        let body = r#"<ownershipDocument>
+  <reportingOwner><rptOwnerCik>0001214156</rptOwnerCik><rptOwnerName>Cook</rptOwnerName></reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+      <transactionShares><value>1</value></transactionShares>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"#;
+        let rows = parse_fixture(
+            body,
+            "0000320193-26-000001",
+            "0000320193",
+            "Apple Inc.",
+            "4",
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn decodes_xml_entities() {
+        let body = r#"<ownershipDocument>
+  <issuerTradingSymbol>AAPL</issuerTradingSymbol>
+  <reportingOwner>
+    <rptOwnerCik>0001214156</rptOwnerCik>
+    <rptOwnerName>Cook &amp; Family</rptOwnerName>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-09-10</value></transactionDate>
+      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+      <transactionShares><value>1</value></transactionShares>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"#;
+        let rows = parse_fixture(
+            body,
+            "0000320193-26-000001",
+            "0000320193",
+            "Apple Inc.",
+            "4",
+        );
+        assert_eq!(rows[0].rpt_owner_name, "Cook & Family");
     }
 }

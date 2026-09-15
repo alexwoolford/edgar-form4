@@ -34,7 +34,17 @@ acquire_lock() {
 acquire_lock
 
 DATE_ARGS=()
-if [[ -n "${EDGAR_INGEST_DATE:-}" ]]; then
+if [[ -n "${EDGAR_INGEST_FROM:-}" || -n "${EDGAR_INGEST_TO:-}" ]]; then
+  if [[ -n "${EDGAR_INGEST_DATE:-}" ]]; then
+    echo "EDGAR_INGEST_DATE cannot be combined with EDGAR_INGEST_FROM/TO" >&2
+    exit 1
+  fi
+  if [[ -z "${EDGAR_INGEST_FROM:-}" || -z "${EDGAR_INGEST_TO:-}" ]]; then
+    echo "EDGAR_INGEST_FROM and EDGAR_INGEST_TO must both be set" >&2
+    exit 1
+  fi
+  DATE_ARGS=(--from "$EDGAR_INGEST_FROM" --to "$EDGAR_INGEST_TO")
+elif [[ -n "${EDGAR_INGEST_DATE:-}" ]]; then
   DATE_ARGS=(--date "$EDGAR_INGEST_DATE")
 fi
 

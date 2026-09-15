@@ -11,6 +11,6 @@ pub mod tickers;
 pub mod time;
 
 pub use db::{open, open_work, WorkDb, DB_NAME};
-pub use ingest::{ingest_day, IngestStats};
+pub use ingest::{ingest_dates, ingest_day, ingest_range, IngestStats};
 pub use sec_ua::{validate_user_agent, UserAgentError};
-pub use time::{utc_date, utc_iso, DATE_FMT, INSTANT_FMT};
+pub use time::{utc_iso, INSTANT_FMT};

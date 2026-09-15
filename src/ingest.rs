@@ -54,28 +54,20 @@ pub fn ingest_day(
 
     let rows = parse_master_index(&idx_resp.body);
     stats.filings_seen = rows.len() as i64;
+    let mut tickers: Option<HashMap<String, String>> = None;
 
-    let tickers = if rows.is_empty() {
-        HashMap::new()
-    } else {
-        match load_tickers(fetcher) {
-            Ok(t) => t,
-            Err(err) => {
-                stats.status = "error".into();
-                finish(db, &as_of, started, &stats)?;
-                return Err(err).context("company_tickers_exchange.json");
-            }
-        }
-    };
-
-    let tx = db.unchecked_transaction()?;
     for row in &rows {
-        match resolve_filing(fetcher, row, &tickers, &mut stats) {
+        match resolve_filing(fetcher, row, &mut tickers, &mut stats) {
             Ok(purchases) => {
-                for p in purchases {
-                    if upsert_purchase(&tx, &p)? {
-                        stats.filings_upserted += 1;
+                if let Err(err) = persist_filing(db, &purchases, &mut stats) {
+                    stats.status = "error".into();
+                    if let Err(run_err) = finish(db, &as_of, started, &stats) {
+                        tracing::error!(
+                            error = %run_err,
+                            "failed to record ingest_runs after persist error"
+                        );
                     }
+                    return Err(err).context("persist purchases");
                 }
             }
             Err(err) => {
@@ -92,21 +84,23 @@ pub fn ingest_day(
     if stats.filings_failed > 0 {
         stats.status = "partial".into();
     }
-    upsert_run(
-        &tx,
-        &as_of,
-        started,
-        Utc::now(),
-        &stats.status,
-        &stats.index_url,
-        stats.filings_seen,
-        stats.filings_upserted,
-        stats.filings_failed,
-        stats.txt_ok,
-    )?;
-    tx.commit()?;
-    db.nudge.send();
+    finish(db, &as_of, started, &stats)?;
     Ok(stats)
+}
+
+fn persist_filing(
+    db: &mut WorkDb,
+    purchases: &[crate::ownership::Purchase],
+    stats: &mut IngestStats,
+) -> Result<()> {
+    let tx = db.unchecked_transaction()?;
+    for p in purchases {
+        if upsert_purchase(&tx, p)? {
+            stats.filings_upserted += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn finish(
@@ -144,10 +138,20 @@ fn load_tickers(fetcher: &mut dyn Fetcher) -> Result<HashMap<String, String>> {
     Ok(primary_listings(&companies))
 }
 
+fn ensure_tickers<'a>(
+    fetcher: &mut dyn Fetcher,
+    cache: &'a mut Option<HashMap<String, String>>,
+) -> Result<&'a HashMap<String, String>> {
+    if cache.is_none() {
+        *cache = Some(load_tickers(fetcher)?);
+    }
+    Ok(cache.as_ref().expect("tickers cache just set"))
+}
+
 fn resolve_filing(
     fetcher: &mut dyn Fetcher,
     row: &IndexRow,
-    tickers: &HashMap<String, String>,
+    tickers: &mut Option<HashMap<String, String>>,
     stats: &mut IngestStats,
 ) -> Result<Vec<crate::ownership::Purchase>> {
     let accession = accession_from_filename(&row.filename);
@@ -156,8 +160,7 @@ fn resolve_filing(
     if txt.status != 200 {
         anyhow::bail!("filing HTTP {} for {url}", txt.status);
     }
-    let ticker = tickers.get(&row.cik).cloned();
-    let purchases = parse_purchases(
+    let mut purchases = parse_purchases(
         &txt.body,
         &accession,
         &row.cik,
@@ -165,8 +168,28 @@ fn resolve_filing(
         &row.form,
         &row.filed_date,
         &row.filename,
-        ticker,
+        None,
     )?;
+    if purchases.iter().any(|p| p.ticker.is_none()) {
+        match ensure_tickers(fetcher, tickers) {
+            Ok(map) => {
+                let fallback = map.get(&row.cik).cloned();
+                for p in &mut purchases {
+                    if p.ticker.is_none() {
+                        p.ticker = fallback.clone();
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    cik = %row.cik,
+                    filename = %row.filename,
+                    error = %err,
+                    "tickers fallback failed; storing NULL ticker"
+                );
+            }
+        }
+    }
     stats.txt_ok += 1;
     Ok(purchases)
 }
@@ -197,6 +220,52 @@ pub fn default_as_of() -> NaiveDate {
         .date_naive()
         .checked_sub_days(Days::new(1))
         .expect("yesterday")
+}
+
+/// Inclusive UTC calendar days `[from, to]`.
+pub fn inclusive_days(from: NaiveDate, to: NaiveDate) -> Result<Vec<NaiveDate>> {
+    if from > to {
+        anyhow::bail!("--from {from} is after --to {to}");
+    }
+    let mut days = Vec::new();
+    let mut d = from;
+    loop {
+        days.push(d);
+        if d == to {
+            return Ok(days);
+        }
+        d = d.succ_opt().context("date overflow")?;
+    }
+}
+
+/// CLI window: default yesterday, one `--date`, or `--from`/`--to` together.
+pub fn ingest_dates(
+    date: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Vec<NaiveDate>> {
+    match (date, from, to) {
+        (None, None, None) => Ok(vec![default_as_of()]),
+        (Some(d), None, None) => Ok(vec![parse_as_of(d)?]),
+        (None, Some(f), Some(t)) => inclusive_days(parse_as_of(f)?, parse_as_of(t)?),
+        (Some(_), _, _) => anyhow::bail!("--date cannot be combined with --from/--to"),
+        _ => anyhow::bail!("--from and --to must both be set"),
+    }
+}
+
+/// Same-day upsert per UTC calendar day. Stops on weekday index 403 / transport error.
+pub fn ingest_range(
+    db: &mut WorkDb,
+    from: NaiveDate,
+    to: NaiveDate,
+    fetcher: &mut dyn Fetcher,
+) -> Result<Vec<IngestStats>> {
+    let mut out = Vec::new();
+    for day in inclusive_days(from, to)? {
+        tracing::info!(date = %day, "ingest day");
+        out.push(ingest_day(db, day, fetcher)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -501,7 +570,7 @@ mod tests {
         {
             let tx = t.db.unchecked_transaction().unwrap();
             let p = Purchase {
-                trade_id: "x|0000000001|2026-09-11|Common Stock|1||D".into(),
+                trade_id: "x|0000000001|0|2026-09-11|Common Stock|1||D".into(),
                 accession: "0000000000-26-000001".into(),
                 cik: "0000000000".into(),
                 ticker: None,
@@ -543,6 +612,116 @@ mod tests {
     }
 
     #[test]
+    fn xml_ticker_does_not_require_tickers_json() {
+        let mut t = test_db();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let filename = "edgar/data/320193/0000320193-26-000200.txt";
+        let idx = "Description: fixture\n\nCIK|Company Name|Form Type|Date Filed|Filename\n--------------------------------------------------------------------------------\n0000320193|Apple Inc.|4|20260911|edgar/data/320193/0000320193-26-000200.txt\n";
+        let mut urls = HashMap::new();
+        urls.insert(
+            master_index_url(date),
+            HttpResponse {
+                status: 200,
+                body: idx.into(),
+            },
+        );
+        urls.insert(
+            filing_url(filename),
+            HttpResponse {
+                status: 200,
+                body: include_str!("../fixtures/aapl-form4-purchase.txt").into(),
+            },
+        );
+        let mut fetcher = MapFetcher { urls };
+        let stats = ingest_day(&mut t.db, date, &mut fetcher).unwrap();
+        assert_eq!(stats.status, "ok");
+        assert_eq!(stats.filings_upserted, 1);
+        let rows = lookup_purchases(&t.db, "AAPL").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ticker.as_deref(), Some("AAPL"));
+    }
+
+    #[test]
+    fn two_identical_p_rows_upsert_separately() {
+        let mut t = test_db();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let filename = "edgar/data/320193/0000320193-26-000220.txt";
+        let idx = "Description: fixture\n\nCIK|Company Name|Form Type|Date Filed|Filename\n--------------------------------------------------------------------------------\n0000320193|Apple Inc.|4|20260911|edgar/data/320193/0000320193-26-000220.txt\n";
+        let mut urls = HashMap::new();
+        urls.insert(
+            master_index_url(date),
+            HttpResponse {
+                status: 200,
+                body: idx.into(),
+            },
+        );
+        urls.insert(
+            filing_url(filename),
+            HttpResponse {
+                status: 200,
+                body: include_str!("../fixtures/aapl-form4-two-purchases.txt").into(),
+            },
+        );
+        let mut fetcher = MapFetcher { urls };
+        let stats = ingest_day(&mut t.db, date, &mut fetcher).unwrap();
+        assert_eq!(stats.filings_upserted, 2);
+        assert_eq!(stats.status, "ok");
+        let rows = lookup_purchases(&t.db, "AAPL").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].trade_id, rows[1].trade_id);
+    }
+
+    #[test]
+    fn missing_reporting_owner_counts_as_failed() {
+        let mut t = test_db();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let filename = "edgar/data/320193/0000320193-26-000298.txt";
+        let idx = "Description: fixture\n\nCIK|Company Name|Form Type|Date Filed|Filename\n--------------------------------------------------------------------------------\n0000320193|Apple Inc.|4|20260911|edgar/data/320193/0000320193-26-000298.txt\n";
+        let body = r#"<ownershipDocument>
+  <issuerTradingSymbol>AAPL</issuerTradingSymbol>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-09-10</value></transactionDate>
+      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+      <transactionShares><value>1</value></transactionShares>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"#;
+        let mut urls = HashMap::new();
+        urls.insert(
+            master_index_url(date),
+            HttpResponse {
+                status: 200,
+                body: idx.into(),
+            },
+        );
+        urls.insert(
+            filing_url(filename),
+            HttpResponse {
+                status: 200,
+                body: body.into(),
+            },
+        );
+        let mut fetcher = MapFetcher { urls };
+        let stats = ingest_day(&mut t.db, date, &mut fetcher).unwrap();
+        assert_eq!(stats.filings_failed, 1);
+        assert_eq!(stats.status, "partial");
+        assert!(lookup_purchases(&t.db, "AAPL").unwrap().is_empty());
+    }
+
+    #[test]
+    fn lookup_like_wildcards_are_literal() {
+        let mut t = test_db();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let mut fetcher = fixture_fetcher();
+        ingest_day(&mut t.db, date, &mut fetcher).unwrap();
+        assert!(lookup_purchases(&t.db, "%").unwrap().is_empty());
+        assert!(lookup_purchases(&t.db, "_").unwrap().is_empty());
+        assert!(!lookup_purchases(&t.db, "Cook").unwrap().is_empty());
+    }
+
+    #[test]
     fn source_has_no_insert_or_replace() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         fn walk(p: &std::path::Path, hits: &mut Vec<String>) {
@@ -566,5 +745,76 @@ mod tests {
         let mut hits = Vec::new();
         walk(&root, &mut hits);
         assert!(hits.is_empty(), "forbidden replace idiom in {hits:?}");
+    }
+
+    #[test]
+    fn ingest_dates_from_to_inclusive() {
+        let days = ingest_dates(None, Some("2026-06-08"), Some("2026-06-10")).unwrap();
+        assert_eq!(
+            days,
+            vec![
+                NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ingest_dates_rejects_from_after_to() {
+        let err = ingest_dates(None, Some("2026-06-10"), Some("2026-06-08")).unwrap_err();
+        assert!(err.to_string().contains("after"));
+    }
+
+    #[test]
+    fn ingest_range_weekend_then_weekday() {
+        let mut t = test_db();
+        let fri = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let sat = NaiveDate::from_ymd_opt(2026, 9, 12).unwrap();
+        let mut fetcher = fixture_fetcher();
+        fetcher.urls.insert(
+            master_index_url(sat),
+            HttpResponse {
+                status: 404,
+                body: "not found".into(),
+            },
+        );
+        let stats = ingest_range(&mut t.db, fri, sat, &mut fetcher).unwrap();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].status, "ok");
+        assert!(stats[0].filings_upserted >= 1);
+        assert_eq!(stats[1].status, "ok");
+        assert_eq!(stats[1].filings_seen, 0);
+        assert!(!lookup_purchases(&t.db, "AAPL").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ingest_range_stops_on_weekday_403() {
+        let mut t = test_db();
+        let fri = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let sat = NaiveDate::from_ymd_opt(2026, 9, 12).unwrap();
+        let mut fetcher = MapFetcher {
+            urls: HashMap::from([
+                (
+                    master_index_url(fri),
+                    HttpResponse {
+                        status: 403,
+                        body: "forbidden".into(),
+                    },
+                ),
+                (
+                    master_index_url(sat),
+                    HttpResponse {
+                        status: 404,
+                        body: "not found".into(),
+                    },
+                ),
+            ]),
+        };
+        let err = ingest_range(&mut t.db, fri, sat, &mut fetcher).unwrap_err();
+        assert!(err.to_string().contains("HTTP 403"));
+        let run = last_run(&t.db).unwrap().unwrap();
+        assert_eq!(run.as_of_date, "2026-09-11");
+        assert_eq!(run.status, "error");
     }
 }
