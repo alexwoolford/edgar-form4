@@ -39,10 +39,6 @@ fn open_conn(path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
     apply_runtime_pragmas(&conn)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     apply_schema(&conn)?;
     Ok(conn)
 }

@@ -86,6 +86,7 @@ fn run() -> Result<ExitCode> {
             let mut all_ok = true;
             for day in days {
                 tracing::info!(date = %day, "ingest day");
+                let started = std::time::Instant::now();
                 let stats = ingest_day(&mut db, day, &mut fetcher)?;
                 tracing::info!(
                     date = %day,
@@ -94,6 +95,7 @@ fn run() -> Result<ExitCode> {
                     upserted = stats.filings_upserted,
                     failed = stats.filings_failed,
                     txt_ok = stats.txt_ok,
+                    duration_ms = started.elapsed().as_millis() as u64,
                     "ingest finished"
                 );
                 if stats.status != "ok" {

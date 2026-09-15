@@ -271,9 +271,12 @@ pub fn ingest_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{last_run, lookup_purchases, open_work, outbox_count, upsert_purchase};
+    use crate::db::{
+        last_run, lookup_purchases, open_work, outbox_count, upsert_purchase, DB_NAME,
+    };
     use crate::http::{HttpResponse, MapFetcher};
     use crate::ownership::Purchase;
+    use crate::time::{parse_utc_iso, DATE_FMT};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -609,6 +612,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn db_name_and_announce_stem_match_repo() {
+        assert_eq!(DB_NAME, "edgar-form4");
+        let _t = test_db();
+        let announce_dir = std::env::var("STATE_CAPTURE_ANNOUNCE_DIR").unwrap();
+        let announce = std::path::Path::new(&announce_dir).join(format!("{DB_NAME}.json"));
+        assert!(
+            announce.exists(),
+            "announce file missing: {}",
+            announce.display()
+        );
+        let body = std::fs::read_to_string(&announce).unwrap();
+        assert!(body.contains(DB_NAME), "announce body: {body}");
+    }
+
+    #[test]
+    fn ingest_run_and_purchase_clocks_are_text_iso() {
+        let mut t = test_db();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let mut fetcher = fixture_fetcher();
+        ingest_day(&mut t.db, date, &mut fetcher).unwrap();
+        let run = last_run(&t.db).unwrap().unwrap();
+        assert_eq!(run.as_of_date, "2026-09-11");
+        NaiveDate::parse_from_str(&run.as_of_date, DATE_FMT).unwrap();
+        parse_utc_iso(&run.started_at).unwrap();
+        parse_utc_iso(&run.finished_at).unwrap();
+        let rows = lookup_purchases(&t.db, "AAPL").unwrap();
+        assert!(!rows.is_empty());
+        for p in rows {
+            NaiveDate::parse_from_str(&p.filed_date, DATE_FMT).unwrap();
+            NaiveDate::parse_from_str(&p.transaction_date, DATE_FMT).unwrap();
+        }
     }
 
     #[test]
